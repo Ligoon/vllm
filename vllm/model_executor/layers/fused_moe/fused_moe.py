@@ -5,7 +5,6 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -416,37 +415,6 @@ def fused_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
-
-def skewed_dist_maker(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool
-):
-    # gating_output size: (num_tokens, n_experts)
-    # hidden_states size: (num_tokens, hidden_size)
-    assert hidden_states.shape[0] == gating_output.shape[0], (
-        "Number of tokens mismatch")
-    
-    M, _ = hidden_states.shape
-    fixed_expert_index = 2
-    
-    routing_weights = F.softmax(gating_output, dim=1, dtype=torch.float)
-    reduced_weights, reduced_indices = routing_weights.topk(topk - 1, dim=-1)
-    original_weights, original_indices = routing_weights.topk(topk, dim=-1)
-    is_fixed_expert_in_topk = (reduced_indices == fixed_expert_index).any(dim=1)
-    reduced_weights = torch.cat((reduced_weights, routing_weights[:, fixed_expert_index].unsqueeze(-1)), dim=-1)
-    reduced_indices = torch.cat((reduced_indices, torch.full((M, 1), fixed_expert_index, dtype=torch.int32)), dim=-1)
-    
-    # Replace rows where fixed expert is in topk - 1
-    reduced_weights[is_fixed_expert_in_topk] = original_weights[is_fixed_expert_in_topk]
-    reduced_indices[is_fixed_expert_in_topk] = original_indices[is_fixed_expert_in_topk]
-
-    if renormalize:
-        reduced_weights = reduced_weights / reduced_weights.sum(dim=-1, keepdim=True)
-
-    return reduced_weights, reduced_indices
-
     
 # This is used by the Deepseek-V2 model
 def grouped_topk(hidden_states: torch.Tensor,

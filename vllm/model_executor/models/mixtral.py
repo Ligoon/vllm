@@ -30,7 +30,6 @@ from transformers import MixtralConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe.fused_moe import skewed_dist_maker
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
@@ -50,6 +49,39 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
+
+def skewed_dist_maker(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool
+):
+    # gating_output size: (num_tokens, n_experts)
+    # hidden_states size: (num_tokens, hidden_size)
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        "Number of tokens mismatch")
+    
+    M, _ = hidden_states.shape
+    fixed_expert_index = 2
+
+    with torch.no_grad():
+        routing_weights = torch.softmax(gating_output, dim=1, dtype=torch.float)
+        reduced_weights, reduced_indices = routing_weights.topk(topk - 1, dim=-1)
+        original_weights, original_indices = routing_weights.topk(topk, dim=-1)
+        is_fixed_expert_in_topk = (reduced_indices == fixed_expert_index).any(dim=1)
+        reduced_weights = torch.cat((reduced_weights, routing_weights[:, fixed_expert_index].unsqueeze(-1)), dim=-1)
+        reduced_indices = torch.cat((reduced_indices, torch.full((M, 1), fixed_expert_index, dtype=torch.int32).to(hidden_states.device)), dim=-1)
+        
+        # Replace rows where fixed expert is in topk - 1
+        reduced_weights[is_fixed_expert_in_topk] = original_weights[is_fixed_expert_in_topk]
+        reduced_indices[is_fixed_expert_in_topk] = original_indices[is_fixed_expert_in_topk]
+
+    del is_fixed_expert_in_topk
+
+    if renormalize:
+        reduced_weights = reduced_weights / reduced_weights.sum(dim=-1, keepdim=True)
+
+    return reduced_weights, reduced_indices
 
 class MixtralMoE(nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
